@@ -1,9 +1,9 @@
 //! Volumes tab — port of `dwRenderVolumes`.
 //!
 //! macOS: APFS container tree with volumes nested under their container.
-//! Linux: mdraid arrays with their members, and ZFS pools with one row per
-//! top-level vdev. LVM is deferred. With nothing to list this renders a
-//! banner explaining what would appear.
+//! Linux: mdraid arrays with their members, ZFS pools with one row per
+//! top-level vdev, and LVM volume groups with their LVs and PVs. With
+//! nothing to list this renders a banner explaining what would appear.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -13,15 +13,90 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::collect::hot_files::PoolHot;
+use crate::collect::lvm::{LvmLv, LvmPv, LvmVg};
 use crate::collect::volumes::{ApfsContainer, ApfsVolume, VolumeTick};
 use crate::collect::zfs::{VdevClass, ZfsPool, ZfsVdev};
 use crate::ui::format::{fmt_size, pad_left, pad_right, usage_color};
 use crate::ui::palette as p;
 
+/// The Volumes tab's filter: every kind, or just one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VolumeKind {
+    #[default]
+    All,
+    Apfs,
+    Mdraid,
+    Zfs,
+    Lvm,
+}
+
+impl VolumeKind {
+    const ORDER: [VolumeKind; 5] = [
+        VolumeKind::All,
+        VolumeKind::Apfs,
+        VolumeKind::Mdraid,
+        VolumeKind::Zfs,
+        VolumeKind::Lvm,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            VolumeKind::All => "all",
+            VolumeKind::Apfs => "apfs",
+            VolumeKind::Mdraid => "mdraid",
+            VolumeKind::Zfs => "zfs",
+            VolumeKind::Lvm => "lvm",
+        }
+    }
+
+    /// This machine has at least one volume of this kind.
+    fn present(self, vols: &VolumeTick) -> bool {
+        match self {
+            VolumeKind::All => true,
+            VolumeKind::Apfs => !vols.containers.is_empty(),
+            VolumeKind::Mdraid => !vols.mdraid.is_empty(),
+            VolumeKind::Zfs => !vols.zfs.is_empty(),
+            VolumeKind::Lvm => !vols.lvm.is_empty(),
+        }
+    }
+
+    /// The filter in force: a kind whose last volume has gone (a pool
+    /// exported, a VG deactivated) falls back to all rather than an empty
+    /// tree.
+    pub fn effective(self, vols: &VolumeTick) -> VolumeKind {
+        if self.present(vols) {
+            self
+        } else {
+            VolumeKind::All
+        }
+    }
+
+    /// The next (`dir` 1) or previous (-1) kind this machine has.
+    pub fn cycle(self, vols: &VolumeTick, dir: isize) -> VolumeKind {
+        let kinds: Vec<VolumeKind> = Self::ORDER
+            .into_iter()
+            .filter(|k| k.present(vols))
+            .collect();
+        let at = kinds
+            .iter()
+            .position(|k| *k == self.effective(vols))
+            .unwrap_or(0) as isize;
+        kinds[(at + dir).rem_euclid(kinds.len() as isize) as usize]
+    }
+
+    fn shows(self, kind: VolumeKind) -> bool {
+        self == VolumeKind::All || self == kind
+    }
+}
+
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let vols = &app.volumes;
-    if vols.containers.is_empty() && vols.mdraid.is_empty() && vols.zfs.is_empty() {
-        draw_empty(f, area, vols.zfs_note.as_deref());
+    if vols.containers.is_empty()
+        && vols.mdraid.is_empty()
+        && vols.zfs.is_empty()
+        && vols.lvm.is_empty()
+    {
+        draw_empty(f, area, vols);
         return;
     }
     let rows = Layout::default()
@@ -29,11 +104,12 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(2), Constraint::Min(8)])
         .split(area);
 
-    draw_filter_row(f, rows[0], vols);
-    draw_tree(f, rows[1], app);
+    let filter = app.volume_filter.effective(vols);
+    draw_filter_row(f, rows[0], vols, filter);
+    draw_tree(f, rows[1], app, filter);
 }
 
-fn draw_empty(f: &mut Frame, area: Rect, zfs_note: Option<&str>) {
+fn draw_empty(f: &mut Frame, area: Rect, vols: &VolumeTick) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::faint()).bg(p::bg()))
@@ -52,17 +128,20 @@ fn draw_empty(f: &mut Frame, area: Rect, zfs_note: Option<&str>) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  macOS APFS containers, Linux mdraid arrays and ZFS pools",
+            "  macOS APFS containers, Linux mdraid arrays, ZFS pools and LVM",
             Style::default().fg(p::dim()),
         )),
         Line::from(Span::styled(
-            "  appear here when present. LVM volume groups are not listed yet.",
+            "  volume groups appear here when present.",
             Style::default().fg(p::dim()),
         )),
     ];
-    if let Some(note) = zfs_note {
+    let notes: Vec<&String> = vols.zfs_note.iter().chain(&vols.lvm_note).collect();
+    if !notes.is_empty() {
         lines.push(Line::from(""));
-        lines.push(zfs_note_line(note));
+    }
+    for note in notes {
+        lines.push(note_line(note));
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(p::bg())),
@@ -70,19 +149,19 @@ fn draw_empty(f: &mut Frame, area: Rect, zfs_note: Option<&str>) {
     );
 }
 
-/// Shown wherever ZFS is in use but `zpool list` couldn't be read.
-fn zfs_note_line(note: &str) -> Line<'static> {
+/// Shown wherever ZFS or LVM is in use but its tools couldn't be read.
+fn note_line(note: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("  \u{26a0} ", Style::default().fg(p::yellow())),
         Span::styled(note.to_string(), Style::default().fg(p::dim())),
     ])
 }
 
-fn draw_filter_row(f: &mut Frame, area: Rect, vols: &VolumeTick) {
-    let (containers, mdraid, zfs) = (&vols.containers, &vols.mdraid, &vols.zfs);
+fn draw_filter_row(f: &mut Frame, area: Rect, vols: &VolumeTick, filter: VolumeKind) {
+    let (containers, mdraid, zfs, lvm) = (&vols.containers, &vols.mdraid, &vols.zfs, &vols.lvm);
     let plural = |n: usize, what: &str| format!("{} {}{}", n, what, if n == 1 { "" } else { "s" });
     let total_vols: usize = containers.iter().map(|c| c.volumes.len()).sum();
-    let summary = if mdraid.is_empty() && zfs.is_empty() {
+    let summary = if mdraid.is_empty() && zfs.is_empty() && lvm.is_empty() {
         format!(
             "{}, {}",
             plural(containers.len(), "container"),
@@ -99,27 +178,45 @@ fn draw_filter_row(f: &mut Frame, area: Rect, vols: &VolumeTick) {
         if !zfs.is_empty() {
             parts.push(plural(zfs.len(), "zfs pool"));
         }
+        if !lvm.is_empty() {
+            parts.push(plural(lvm.len(), "lvm vg"));
+        }
         parts.join(" / ")
     };
-    let line = Line::from(vec![
+    // The active kind is bracketed as well as bold, so it reads on a
+    // monochrome terminal too. Kinds this machine has none of are faint:
+    // `f` skips them.
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled("show", Style::default().fg(p::dim())),
-        Span::raw("  "),
-        Span::styled(
-            "all",
-            Style::default()
-                .fg(p::br_white())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled("apfs", Style::default().fg(p::fg())),
-        Span::raw("  "),
-        Span::styled("mdraid", Style::default().fg(p::fg())),
-        Span::raw("  "),
-        Span::styled("zfs", Style::default().fg(p::fg())),
-        Span::raw("  "),
-        Span::styled(format!("({})", summary), Style::default().fg(p::dim())),
-    ]);
+        Span::raw(" "),
+    ];
+    for kind in VolumeKind::ORDER {
+        let (text, style) = if kind == filter {
+            (
+                format!("[{}]", kind.label()),
+                Style::default()
+                    .fg(p::br_white())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if kind.present(vols) {
+            (format!(" {} ", kind.label()), Style::default().fg(p::fg()))
+        } else {
+            (
+                format!(" {} ", kind.label()),
+                Style::default().fg(p::faint()),
+            )
+        };
+        spans.push(Span::styled(text, style));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("f", Style::default().fg(p::cyan())));
+    spans.push(Span::styled(" filter  ", Style::default().fg(p::dim())));
+    spans.push(Span::styled(
+        format!("({})", summary),
+        Style::default().fg(p::dim()),
+    ));
+    let line = Line::from(spans);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(p::bg())),
         Rect {
@@ -131,7 +228,7 @@ fn draw_filter_row(f: &mut Frame, area: Rect, vols: &VolumeTick) {
     );
 }
 
-fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
+fn draw_tree(f: &mut Frame, area: Rect, app: &App, filter: VolumeKind) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p::faint()).bg(p::bg()))
@@ -179,7 +276,12 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     let mut y = inner.y + 2;
     let max_y = inner.y + inner.height;
 
-    for container in &app.volumes.containers {
+    let containers = app
+        .volumes
+        .containers
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Apfs));
+    for container in containers {
         if y >= max_y {
             break;
         }
@@ -197,7 +299,12 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    for arr in &app.volumes.mdraid {
+    for arr in app
+        .volumes
+        .mdraid
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Mdraid))
+    {
         if y >= max_y {
             break;
         }
@@ -221,7 +328,12 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let hot = app.hot_files.pool_activity(&app.filesystems);
-    for pool in &app.volumes.zfs {
+    for pool in app
+        .volumes
+        .zfs
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Zfs))
+    {
         if y >= max_y {
             break;
         }
@@ -255,22 +367,264 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    // Pools that couldn't be read are still worth a line when other
-    // volumes are listed: their absence would otherwise look like none,
-    // and pools kept from an earlier listing would look current.
-    if let Some(note) = &app.volumes.zfs_note {
-        if y + 1 < max_y {
+    for vg in app
+        .volumes
+        .lvm
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Lvm))
+    {
+        let lines = lvm_vg_lines(vg);
+        if y >= max_y {
+            break;
+        }
+        for line in lines {
+            if y >= max_y {
+                break;
+            }
             f.render_widget(
-                Paragraph::new(zfs_note_line(note)).style(Style::default().bg(p::bg())),
+                Paragraph::new(line).style(Style::default().bg(p::bg())),
                 Rect {
                     x: inner.x + 1,
-                    y: y + 1,
+                    y,
                     width: inner.width.saturating_sub(2),
                     height: 1,
                 },
             );
+            y += 1;
         }
     }
+
+    // Pools or VGs that couldn't be read are still worth a line when other
+    // volumes are listed: their absence would otherwise look like none,
+    // and pools kept from an earlier listing would look current.
+    y += 1;
+    let zfs_note = app
+        .volumes
+        .zfs_note
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Zfs));
+    let lvm_note = app
+        .volumes
+        .lvm_note
+        .iter()
+        .filter(|_| filter.shows(VolumeKind::Lvm));
+    for note in zfs_note.chain(lvm_note) {
+        if y >= max_y {
+            break;
+        }
+        f.render_widget(
+            Paragraph::new(note_line(note)).style(Style::default().bg(p::bg())),
+            Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+        y += 1;
+    }
+}
+
+/// A size, or a dash where sysfs couldn't say.
+fn size_or_dash(b: u64) -> String {
+    if b == 0 {
+        "\u{2014}".to_string()
+    } else {
+        fmt_size(b)
+    }
+}
+
+/// One row in the shared column layout: dot, name, kind, size, used,
+/// state, then free text.
+#[allow(clippy::too_many_arguments)]
+fn tree_row(
+    dot: ratatui::style::Color,
+    name: String,
+    bold: bool,
+    kind: &str,
+    kind_color: ratatui::style::Color,
+    size: String,
+    used: String,
+    used_color: ratatui::style::Color,
+    state: (&str, ratatui::style::Color),
+    extra: String,
+) -> Line<'static> {
+    let name_style = if bold {
+        Style::default().fg(p::fg()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p::fg())
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("\u{25cf}", Style::default().fg(dot)),
+        Span::raw(" "),
+        Span::styled(pad_right(&name, 40), name_style),
+        Span::styled(pad_right(kind, 13), Style::default().fg(kind_color)),
+        Span::styled(pad_left(&size, 9), Style::default().fg(p::dim())),
+        Span::raw("  "),
+        Span::styled(pad_left(&used, 5), Style::default().fg(used_color)),
+        Span::raw("  "),
+        Span::styled(pad_right(state.0, 11), Style::default().fg(state.1)),
+        Span::styled(extra, Style::default().fg(p::dim())),
+    ])
+}
+
+/// A VG, then its LVs, then the PVs it sits on.
+fn lvm_vg_lines(vg: &LvmVg) -> Vec<Line<'static>> {
+    let partial = vg.is_partial();
+    let (used, used_pct) = if vg.size_bytes > 0 {
+        let p = pct(
+            vg.size_bytes - vg.free_bytes.min(vg.size_bytes),
+            vg.size_bytes,
+        );
+        (format!("{p}%"), p)
+    } else {
+        ("\u{2014}".to_string(), 0)
+    };
+    let state = if partial {
+        ("PARTIAL", p::red())
+    } else {
+        ("active", p::green())
+    };
+    let lv_count = format!(
+        "{} LV{}",
+        vg.lvs.len(),
+        if vg.lvs.len() == 1 { "" } else { "s" }
+    );
+    let extra = if vg.size_bytes > 0 {
+        format!("{lv_count} \u{b7} {} free", fmt_size(vg.free_bytes))
+    } else {
+        lv_count
+    };
+    let mut lines = vec![tree_row(
+        state.1,
+        format!("\u{25be} {}", vg.name),
+        true,
+        "lvm vg",
+        p::cyan(),
+        size_or_dash(vg.size_bytes),
+        used,
+        usage_color(used_pct),
+        state,
+        extra,
+    )];
+    let n = vg.lvs.len() + vg.pvs.len();
+    let glyph = |i: usize| {
+        if i + 1 == n {
+            "  \u{2514}"
+        } else {
+            "  \u{251c}"
+        }
+    };
+    for (i, lv) in vg.lvs.iter().enumerate() {
+        lines.push(lvm_lv_line(lv, glyph(i)));
+    }
+    for (i, pv) in vg.pvs.iter().enumerate() {
+        lines.push(lvm_pv_line(pv, glyph(vg.lvs.len() + i)));
+    }
+    lines
+}
+
+/// STATE for an LV: lvm2's health word when there is one (shortened to
+/// fit), else whether it's active and in sync.
+fn lv_state(lv: &LvmLv) -> (&'static str, ratatui::style::Color) {
+    if lv.is_invalid_snapshot() {
+        return ("invalid", p::red());
+    }
+    match lv.health.as_str() {
+        "" => {}
+        "partial" => return ("partial", p::red()),
+        "failed" => return ("failed", p::red()),
+        "out of data" => return ("out of data", p::red()),
+        "refresh needed" => return ("refresh", p::yellow()),
+        "mismatches exist" => return ("mismatches", p::yellow()),
+        "metadata read only" => return ("meta ro", p::red()),
+        _ => return ("unhealthy", p::yellow()),
+    }
+    if !lv.is_active() {
+        return ("inactive", p::dim());
+    }
+    if lv.sync_percent.is_some_and(|s| s < 100.0) {
+        return ("syncing", p::yellow());
+    }
+    ("active", p::green())
+}
+
+fn lvm_lv_line(lv: &LvmLv, glyph: &str) -> Line<'static> {
+    let state = lv_state(lv);
+    let (used, used_color) = match lv.fullest_percent() {
+        Some(pc) => {
+            let pc = pc.round() as u32;
+            (format!("{pc}%"), usage_color(pc))
+        }
+        None => ("\u{2014}".to_string(), p::dim()),
+    };
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(d) = &lv.dev {
+        extra.push(d.clone());
+    }
+    if lv.is_thin_pool() {
+        if let (Some(d), Some(m)) = (lv.data_percent, lv.metadata_percent) {
+            extra.push(format!("data {d:.0}% \u{b7} meta {m:.0}%"));
+        }
+    }
+    if let Some(s) = lv.sync_percent.filter(|s| *s < 100.0) {
+        extra.push(format!("sync {s:.0}%"));
+    }
+    if let Some(pool) = &lv.pool {
+        extra.push(format!("in {pool}"));
+    }
+    if let Some(origin) = &lv.origin {
+        extra.push(format!("of {origin}"));
+    }
+    let kind = lv.kind();
+    tree_row(
+        state.1,
+        format!("{glyph} {}", lv.name),
+        false,
+        &kind,
+        p::cyan(),
+        fmt_size(lv.size_bytes),
+        used,
+        used_color,
+        state,
+        extra.join(" \u{b7} "),
+    )
+}
+
+fn lvm_pv_line(pv: &LvmPv, glyph: &str) -> Line<'static> {
+    let state = if pv.missing {
+        ("missing", p::red())
+    } else {
+        ("ok", p::green())
+    };
+    let used = if pv.size_bytes > 0 {
+        format!(
+            "{}%",
+            pct(
+                pv.size_bytes - pv.free_bytes.min(pv.size_bytes),
+                pv.size_bytes
+            )
+        )
+    } else {
+        "\u{2014}".to_string()
+    };
+    tree_row(
+        state.1,
+        format!("{glyph} {}", pv.path),
+        false,
+        "pv",
+        p::dim(),
+        size_or_dash(pv.size_bytes),
+        used,
+        p::fg(),
+        state,
+        if pv.size_bytes > 0 {
+            format!("{} free", fmt_size(pv.free_bytes))
+        } else {
+            String::new()
+        },
+    )
 }
 
 fn pct(part: u64, whole: u64) -> u32 {
@@ -716,8 +1070,13 @@ mod tests {
     use ratatui::Terminal;
 
     fn render(vols: VolumeTick) -> String {
+        render_filtered(vols, VolumeKind::All)
+    }
+
+    fn render_filtered(vols: VolumeTick, filter: VolumeKind) -> String {
         let mut app = App::new_for_test(TabId::Volumes, ViewMode::Full);
         app.volumes = vols;
+        app.volume_filter = filter;
         let mut term = Terminal::new(TestBackend::new(170, 24)).expect("terminal");
         term.draw(|f| draw(f, f.area(), &app)).expect("draw");
         let buf = term.backend().buffer().clone();
@@ -852,6 +1211,185 @@ mod tests {
         });
         assert!(out.contains("\u{25be} rpool"), "{out}");
         assert!(out.contains(note), "{out}");
+    }
+
+    #[test]
+    fn lvm_vgs_list_their_lvs_and_pvs() {
+        let out = render(VolumeTick {
+            lvm: crate::collect::lvm::fixtures::vgs(),
+            ..Default::default()
+        });
+        assert!(out.contains("(2 lvm vgs)"), "{out}");
+        let data = row(&out, "\u{25be} data");
+        for want in ["lvm vg", "1.0 TB", "46%", "active", "5 LVs", "537 GB free"] {
+            assert!(data.contains(want), "{want:?} missing from {data:?}");
+        }
+        let pool = row(&out, "\u{251c} pool");
+        for want in ["thin pool", "215 GB", "61%", "data 61% \u{b7} meta 12%"] {
+            assert!(pool.contains(want), "{want:?} missing from {pool:?}");
+        }
+        assert!(row(&out, "\u{251c} vm1").contains("in pool"));
+        let snap = row(&out, "\u{251c} home_snap");
+        assert!(
+            snap.contains("snapshot") && snap.contains("of home"),
+            "{snap:?}"
+        );
+        let mirror = row(&out, "\u{251c} mirror");
+        assert!(
+            mirror.contains("raid1") && mirror.contains("syncing") && mirror.contains("sync 42%"),
+            "{mirror:?}"
+        );
+        assert!(row(&out, "\u{251c} /dev/sda").contains("pv"));
+        assert!(row(&out, "\u{2514} /dev/sdb").contains("ok"));
+        assert!(row(&out, "\u{2514} /dev/nvme0n1p3").contains("254 GB"));
+        assert!(!out.contains("sdc1"), "a PV in no VG isn't listed");
+    }
+
+    #[test]
+    fn a_degraded_vg_shows_what_broke() {
+        let out = render(VolumeTick {
+            lvm: crate::collect::lvm::fixtures::degraded(),
+            ..Default::default()
+        });
+        assert!(row(&out, "\u{25be} data").contains("PARTIAL"));
+        assert!(row(&out, "\u{251c} mirror").contains("partial"));
+        assert!(row(&out, "\u{251c} old_snap").contains("invalid"));
+        assert!(row(&out, "\u{2514} [unknown]").contains("missing"));
+        assert!(row(&out, "\u{251c} pool").contains("96%"));
+    }
+
+    #[test]
+    fn lvs_from_sysfs_say_what_is_missing() {
+        let note =
+            "lvm2 reports need root; showing active LVs from sysfs, without free space or health";
+        let mut vg = crate::collect::lvm::LvmVg {
+            name: "fedora".into(),
+            ..Default::default()
+        };
+        vg.lvs.push(crate::collect::lvm::LvmLv {
+            name: "root".into(),
+            size_bytes: 64_000_000_000,
+            dev: Some("dm-1".into()),
+            ..Default::default()
+        });
+        vg.pvs.push(crate::collect::lvm::LvmPv {
+            path: "/dev/nvme0n1p3".into(),
+            ..Default::default()
+        });
+        let out = render(VolumeTick {
+            lvm: vec![vg],
+            lvm_note: Some(note.into()),
+            ..Default::default()
+        });
+        let vg = row(&out, "\u{25be} fedora");
+        assert!(vg.contains("\u{2014}") && vg.contains("1 LV"), "{vg:?}");
+        assert!(!vg.contains("free"), "{vg:?}");
+        let root = row(&out, "\u{251c} root");
+        assert!(root.contains("64 GB") && root.contains("dm-1") && root.contains("active"));
+        assert!(out.contains(note), "{out}");
+    }
+
+    #[test]
+    fn the_empty_state_lists_lvm() {
+        let out = render(VolumeTick::default());
+        assert!(out.contains("LVM"), "{out}");
+        assert!(!out.contains("not listed yet"), "{out}");
+    }
+
+    fn zfs_and_lvm() -> VolumeTick {
+        VolumeTick {
+            zfs: fixtures::pools(fixtures::RAIDZ1),
+            lvm: crate::collect::lvm::fixtures::vgs(),
+            zfs_note: Some("zfs note".into()),
+            lvm_note: Some("lvm note".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_filter_cycles_through_kinds_present() {
+        let vols = zfs_and_lvm();
+        let mut k = VolumeKind::All;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            k = k.cycle(&vols, 1);
+            seen.push(k);
+        }
+        assert_eq!(
+            seen,
+            [VolumeKind::Zfs, VolumeKind::Lvm, VolumeKind::All],
+            "apfs and mdraid are skipped"
+        );
+        assert_eq!(VolumeKind::All.cycle(&vols, -1), VolumeKind::Lvm);
+        // Nothing to filter by: stays on all.
+        assert_eq!(
+            VolumeKind::All.cycle(&VolumeTick::default(), 1),
+            VolumeKind::All
+        );
+    }
+
+    #[test]
+    fn a_filter_whose_volumes_vanished_falls_back_to_all() {
+        let vols = VolumeTick {
+            lvm: crate::collect::lvm::fixtures::vgs(),
+            ..Default::default()
+        };
+        assert_eq!(VolumeKind::Zfs.effective(&vols), VolumeKind::All);
+        assert_eq!(VolumeKind::Zfs.cycle(&vols, 1), VolumeKind::Lvm);
+        let out = render_filtered(vols, VolumeKind::Zfs);
+        assert!(
+            out.contains("[all]") && out.contains("\u{25be} data"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn filtering_shows_one_kind_and_its_note() {
+        let out = render_filtered(zfs_and_lvm(), VolumeKind::Lvm);
+        assert!(out.contains("[lvm]") && !out.contains("[all]"), "{out}");
+        assert!(
+            out.contains("\u{25be} data") && out.contains("lvm note"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("\u{25be} media") && !out.contains("zfs note"),
+            "{out}"
+        );
+
+        let out = render_filtered(zfs_and_lvm(), VolumeKind::Zfs);
+        assert!(
+            out.contains("\u{25be} media") && out.contains("zfs note"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("\u{25be} data") && !out.contains("lvm note"),
+            "{out}"
+        );
+
+        let out = render(zfs_and_lvm());
+        assert!(out.contains("[all]"), "{out}");
+        assert!(
+            out.contains("\u{25be} media") && out.contains("\u{25be} data"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn f_cycles_the_filter_only_on_the_volumes_tab() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new_for_test(TabId::Volumes, ViewMode::Full);
+        app.volumes = zfs_and_lvm();
+        crate::app::handle_key(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.volume_filter, VolumeKind::Zfs);
+        crate::app::handle_key(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.volume_filter, VolumeKind::Lvm);
+        crate::app::handle_key(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.volume_filter, VolumeKind::Zfs);
+
+        let mut app = App::new_for_test(TabId::Overview, ViewMode::Full);
+        app.volumes = zfs_and_lvm();
+        crate::app::handle_key(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.volume_filter, VolumeKind::All);
     }
 
     fn text(lines: Vec<Line<'static>>) -> String {
